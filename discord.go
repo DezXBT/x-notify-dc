@@ -932,25 +932,32 @@ func (db *DiscordBot) handleStatus(s *discordgo.Session, i *discordgo.Interactio
 // ────────────────────────────────────────────────────────
 
 // SendTweetNotification sends a tweet embed to a Discord channel.
-func (db *DiscordBot) SendTweetNotification(channelID string, tweet Tweet) error {
+func (db *DiscordBot) SendTweetNotification(channelID string, tweet Tweet, watcherHandle string) error {
 	loc := db.cfg.Timezone()
-
-	// Build description
-	description := tweet.Text
-	// Clean up t.co URLs in text — replace with expanded versions
-	// (X shortens URLs in full_text)
 
 	// Build embed
 	embed := &discordgo.MessageEmbed{
-		Author: &discordgo.MessageEmbedAuthor{
+		URL:   tweet.TweetURL,
+		Color: 0x1DA1F2,
+	}
+
+	if tweet.IsRetweet {
+		// Retweet: show who retweeted and the original author
+		embed.Author = &discordgo.MessageEmbedAuthor{
+			Name:    fmt.Sprintf("🔁 @%s retweeted @%s", watcherHandle, tweet.Author.ScreenName),
+			URL:     tweet.TweetURL,
+			IconURL: tweet.Author.AvatarURL,
+		}
+	} else {
+		// Normal tweet
+		embed.Author = &discordgo.MessageEmbedAuthor{
 			Name:    fmt.Sprintf("%s (@%s)", tweet.Author.Name, tweet.Author.ScreenName),
 			URL:     fmt.Sprintf("https://x.com/%s", tweet.Author.ScreenName),
 			IconURL: tweet.Author.AvatarURL,
-		},
-		Description: description,
-		URL:         tweet.TweetURL,
-		Color:       0x1DA1F2,
+		}
 	}
+
+	embed.Description = tweet.Text
 
 	// Metrics field
 	var metricsParts []string

@@ -164,7 +164,7 @@ func (p *Poller) scanOnce() {
 		// Send notifications (oldest first)
 		for i := len(newTweets) - 1; i >= 0; i-- {
 			tweet := newTweets[i]
-			if err := p.bot.SendTweetNotification(entry.ChannelID, tweet); err != nil {
+			if err := p.bot.SendTweetNotification(entry.ChannelID, tweet, entry.Handle); err != nil {
 				logError("[notify] @%s tweet %s: %v", entry.Handle, tweet.ID, err)
 				pollStats.TotalErrors++
 			} else {
