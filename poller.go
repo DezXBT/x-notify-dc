@@ -105,9 +105,11 @@ func (p *Poller) scanOnce() {
 	started := time.Now()
 	pollStats.TotalPolls++
 	pollStats.LastPollTime = started
+	logDebug("[poll] scan starting")
 
 	entries := p.watch.GetAll()
 	if len(entries) == 0 {
+		logDebug("[poll] no watched accounts")
 		return
 	}
 
@@ -119,6 +121,7 @@ func (p *Poller) scanOnce() {
 
 	// Single API call for ALL notifications
 	xc := p.nextClient()
+	logDebug("[poll] fetching notifications...")
 	page, err := xc.FetchNotifications("all", 40, "")
 	if err != nil {
 		if isAuthError(err) {
@@ -136,8 +139,15 @@ func (p *Poller) scanOnce() {
 	}
 
 	lastCursor := p.state.GetNotifCursor()
-	newCursor := page.NotifIDs[0] // most recent
+	newCursor := page.NotifIDs[0] // most recent notification ID
 	matched := 0
+
+	// Quick check: if the most recent notification hasn't changed since last poll,
+	// there's nothing new. Notification IDs are stable (not comparable to tweet IDs).
+	if lastCursor == newCursor {
+		logDebug("[poll] no new notifications (cursor unchanged)")
+		return
+	}
 
 	for _, tweet := range page.Tweets {
 		handle := strings.ToLower(tweet.Author.ScreenName)
@@ -146,8 +156,9 @@ func (p *Poller) scanOnce() {
 			continue
 		}
 
-		// Skip duplicates: if this tweet ID matches or is older than our cursor
-		if lastCursor != "" && tweet.ID <= lastCursor {
+		// Skip duplicates using per-account last tweet ID (numeric comparison)
+		lastTweetID := p.state.GetLastTweetID(handle)
+		if lastTweetID != "" && tweet.ID <= lastTweetID {
 			continue
 		}
 
@@ -167,7 +178,7 @@ func (p *Poller) scanOnce() {
 		time.Sleep(100 * time.Millisecond) // Discord rate limit
 	}
 
-	// Update cursor to most recent notification
+	// Update notification cursor
 	if newCursor != "" && newCursor != lastCursor {
 		p.state.SetNotifCursor(newCursor)
 	}
@@ -186,7 +197,7 @@ func (p *Poller) scanOnce() {
 	p.state.Save()
 
 	elapsed := time.Since(started)
-	logInfo("[poll] scan done: %d tweets matched from notifications in %s", matched, elapsed.Round(time.Millisecond))
+	logDebug("[poll] scan done: %d tweets matched from notifications in %s", matched, elapsed.Round(time.Millisecond))
 }
 
 func isAuthError(err error) bool {

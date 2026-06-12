@@ -77,6 +77,14 @@ func (xc *XClient) FetchNotifications(tab string, count int, cursor string) (*No
 }
 
 // parseNotificationsPage parses the legacy globalObjects + timeline structure.
+// X notifications format:
+//
+//	timeline.instructions[].addEntries[].entries[] → notification items
+//	globalObjects.notifications[id] → notification with template.aggregateUserActionsV1
+//	  .targetObjects[].tweet.id → tweet ID
+//	  .fromUsers[].user.id → user ID
+//	globalObjects.tweets[id] → tweet data
+//	globalObjects.users[id] → user data
 func parseNotificationsPage(body []byte) (*NotificationPage, error) {
 	var root map[string]interface{}
 	if err := json.Unmarshal(body, &root); err != nil {
@@ -86,6 +94,7 @@ func parseNotificationsPage(body []byte) (*NotificationPage, error) {
 	objs := mapGet(root, "globalObjects")
 	tweets := mapGet(objs, "tweets")
 	users := mapGet(objs, "users")
+	notifs := mapGet(objs, "notifications")
 
 	page := &NotificationPage{}
 
@@ -97,10 +106,8 @@ func parseNotificationsPage(body []byte) (*NotificationPage, error) {
 			continue
 		}
 
-		// Try addEntries path first
 		entries := sliceGet(mapGet(instMap, "addEntries"), "entries")
 		if entries == nil {
-			// Some responses use replaceEntry or type-specific keys
 			entries = sliceGet(instMap, "entries")
 		}
 
@@ -119,28 +126,60 @@ func parseNotificationsPage(body []byte) (*NotificationPage, error) {
 				continue
 			}
 
-			// Notification item (text-only, e.g. "X liked your post")
-			if n := mapGet(mapGet(mapGet(content, "item"), "content"), "notification"); n != nil {
-				page.NotifIDs = append(page.NotifIDs, mapGetString(n, "id"))
+			// Notification item → resolve via globalObjects.notifications
+			notifRef := mapGet(mapGet(mapGet(content, "item"), "content"), "notification")
+			if notifRef == nil {
 				continue
 			}
 
-			// Tweet item — the actual tweet in notifications
-			tw := mapGet(mapGet(mapGet(content, "item"), "content"), "tweet")
-			if tw == nil {
-				// Also try direct tweet reference at entry level
-				tw = mapGet(content, "tweet")
+			notifID := mapGetString(notifRef, "id")
+			nd := mapGet(notifs, notifID)
+			if nd == nil {
+				page.NotifIDs = append(page.NotifIDs, notifID)
+				continue
 			}
-			if tw != nil {
-				tweetID := mapGetString(tw, "id")
-				td := mapGet(tweets, tweetID)
-				if td == nil {
-					td = tw
+
+			page.NotifIDs = append(page.NotifIDs, notifID)
+
+			// Extract tweet references from template.aggregateUserActionsV1
+			targetObjects := sliceGet(mapGet(mapGet(nd, "template"), "aggregateUserActionsV1"), "targetObjects")
+			fromUsers := sliceGet(mapGet(mapGet(nd, "template"), "aggregateUserActionsV1"), "fromUsers")
+
+			// Get author user ID from fromUsers
+			var authorUserID string
+			if len(fromUsers) > 0 {
+				if fu, ok := fromUsers[0].(map[string]interface{}); ok {
+					if u := mapGet(fu, "user"); u != nil {
+						authorUserID = mapGetString(u, "id")
+					}
+				}
+			}
+
+			for _, to := range targetObjects {
+				toMap, ok := to.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				twRef := mapGet(toMap, "tweet")
+				if twRef == nil {
+					continue
+				}
+				tweetID := mapGetString(twRef, "id")
+				if tweetID == "" {
+					continue
 				}
 
-				// Inject user from globalObjects
+				td := mapGet(tweets, tweetID)
+				if td == nil {
+					continue
+				}
+
+				// Inject user from globalObjects.users
 				if _, ok := td["user"]; !ok {
 					uid := mapGetString(td, "user_id_str")
+					if uid == "" {
+						uid = authorUserID
+					}
 					if u := mapGet(users, uid); u != nil {
 						td["user"] = u
 					}
@@ -149,7 +188,6 @@ func parseNotificationsPage(body []byte) (*NotificationPage, error) {
 				tweet := parseV11Tweet(td)
 				if tweet != nil {
 					page.Tweets = append(page.Tweets, *tweet)
-					page.NotifIDs = append(page.NotifIDs, tweetID)
 				}
 			}
 		}
