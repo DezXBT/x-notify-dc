@@ -30,8 +30,9 @@ type TrackingConfig struct {
 }
 
 type DiscordConfig struct {
-	BotToken string `yaml:"bot_token"`
-	GuildID  string `yaml:"guild_id,omitempty"`
+	BotToken       string `yaml:"bot_token"`
+	GuildID        string `yaml:"guild_id,omitempty"`
+	DefaultChannel string `yaml:"default_channel,omitempty"`
 }
 
 type LogConfig struct {
@@ -117,6 +118,9 @@ func loadConfig(path string) (*Config, error) {
 func validateConfig(cfg *Config) error {
 	if cfg.Discord.BotToken == "" {
 		return fmt.Errorf("discord.bot_token required")
+	}
+	if cfg.Discord.DefaultChannel == "" {
+		return fmt.Errorf("discord.default_channel required — set the channel ID where notifications will be sent")
 	}
 	if len(cfg.Twitter.Cookies) == 0 {
 		return fmt.Errorf("twitter.cookies required (at least one)")

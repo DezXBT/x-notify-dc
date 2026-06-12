@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/bwmarrin/discordgo"
@@ -49,6 +51,18 @@ func (db *DiscordBot) Close() {
 // RegisterCommands registers slash commands.
 func (db *DiscordBot) RegisterCommands(guildID string) error {
 	commands := []*discordgo.ApplicationCommand{
+		{
+			Name:        "setup",
+			Description: "Set the default notification channel",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionChannel,
+					Name:        "channel",
+					Description: "Channel for notifications",
+					Required:    true,
+				},
+			},
+		},
 		{
 			Name:        "add",
 			Description: "Add an X/Twitter account to watch for new tweets",
@@ -140,6 +154,8 @@ func (db *DiscordBot) handleInteraction(s *discordgo.Session, i *discordgo.Inter
 
 	data := i.ApplicationCommandData()
 	switch data.Name {
+	case "setup":
+		db.handleSetup(s, i, data)
 	case "add":
 		db.handleAdd(s, i, data)
 	case "remove":
@@ -154,6 +170,69 @@ func (db *DiscordBot) handleInteraction(s *discordgo.Session, i *discordgo.Inter
 }
 
 // ────────────────────────────────────────────────────────
+// /setup
+// ────────────────────────────────────────────────────────
+
+func (db *DiscordBot) handleSetup(s *discordgo.Session, i *discordgo.InteractionCreate, data discordgo.ApplicationCommandInteractionData) {
+	ch := getChannelOption(data.Options, "channel")
+	if ch == "" {
+		respond(s, i, "❌ Please specify a channel.")
+		return
+	}
+
+	// Update config in memory
+	db.cfg.Discord.DefaultChannel = ch
+
+	// Update config.yaml file
+	if err := updateConfigDefaultChannel(ch); err != nil {
+		logWarn("[setup] failed to update config.yaml: %v", err)
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "✅ Notification Channel Set",
+		Description: fmt.Sprintf("All new notifications will be sent to <#%s>", ch),
+		Color:       0x00FF00,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: "Channel", Value: fmt.Sprintf("<#%s>", ch), Inline: true},
+			{Name: "Channel ID", Value: ch, Inline: true},
+		},
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: fmt.Sprintf("x-notify-dc | %s WIB", time.Now().In(db.cfg.Timezone()).Format("02/01/2006, 15:04:05")),
+		},
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{embed},
+		},
+	})
+	logInfo("[setup] default channel set to %s by %s", ch, i.Member.User.Username)
+}
+
+// updateConfigDefaultChannel updates the default_channel in config.yaml
+func updateConfigDefaultChannel(channelID string) error {
+	path := "config.yaml"
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	content := string(data)
+	// Simple string replacement
+	if strings.Contains(content, "default_channel:") {
+		// Replace existing
+		lines := strings.Split(content, "\n")
+		for i, line := range lines {
+			if strings.Contains(line, "default_channel:") {
+				lines[i] = fmt.Sprintf("  default_channel: \"%s\"", channelID)
+			}
+		}
+		return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0644)
+	}
+	return nil
+}
+
+// ────────────────────────────────────────────────────────
 // /add
 // ────────────────────────────────────────────────────────
 
@@ -165,8 +244,8 @@ func (db *DiscordBot) handleAdd(s *discordgo.Session, i *discordgo.InteractionCr
 		return
 	}
 
-	// Determine target channel
-	channelID := i.ChannelID
+	// Determine target channel: /add channel param > default_channel from config
+	channelID := db.cfg.Discord.DefaultChannel
 	if ch := getChannelOption(data.Options, "channel"); ch != "" {
 		channelID = ch
 	}

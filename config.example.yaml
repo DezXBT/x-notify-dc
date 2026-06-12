@@ -1,7 +1,8 @@
 # x-notify-dc config
 discord:
   bot_token: ""           # Discord bot token
-  guild_id: ""            # Optional: restrict to one server for instant slash commands
+  guild_id: ""            # Optional: restrict to one server
+  default_channel: ""     # Default channel for notifications (required) for instant slash commands
 
 twitter:
   cookies:
