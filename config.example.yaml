@@ -1,22 +1,21 @@
-# x-notify-dc config
+# x-notify-dc configuration
+# Place at /root/x-notify-dc/config.yaml
+
 discord:
-  bot_token: ""           # Discord bot token
-  guild_id: ""            # Optional: restrict to one server
-  default_channel: ""     # Default channel for notifications (required) for instant slash commands
+  bot_token: "${DISCORD_BOT_TOKEN}"
+  default_channel: "1514976399419510865"
 
 twitter:
   cookies:
-    - auth_token: ""
-      ct0: ""
+    - auth_token: "${AUTH_TOKEN}"
+      ct0: "${CT0}"
       label: "main"
-    # - auth_token: ""
-    #   ct0: ""
-    #   label: "backup"
   health_check_interval: "5m"
-  alert_webhook: ""       # Discord webhook for cookie health alerts
 
 tracking:
-  poll_interval: "60s"
+  poll_interval: "5s"          # Fast polling when active
+  idle_poll_interval: "30s"    # Slow polling when idle (5 min no activity)
+  idle_threshold: "5m"         # How long before switching to idle mode
   tweets_per_check: 5
 
 logging:

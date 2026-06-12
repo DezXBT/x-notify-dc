@@ -27,6 +27,10 @@ type TwitterConfig struct {
 type TrackingConfig struct {
 	PollInterval   string `yaml:"poll_interval"`
 	TweetsPerCheck int    `yaml:"tweets_per_check"`
+	// Adaptive polling: when idle, back off to IdlePollInterval
+	IdlePollInterval string `yaml:"idle_poll_interval,omitempty"`
+	// How long with no activity before switching to idle interval
+	IdleThreshold string `yaml:"idle_threshold,omitempty"`
 }
 
 type DiscordConfig struct {
@@ -67,6 +71,22 @@ func (c *Config) Timezone() *time.Location {
 	return loc
 }
 
+func (c *Config) IdlePollIntervalDuration() time.Duration {
+	d, err := time.ParseDuration(c.Tracking.IdlePollInterval)
+	if err != nil {
+		return 30 * time.Second
+	}
+	return d
+}
+
+func (c *Config) IdleThresholdDuration() time.Duration {
+	d, err := time.ParseDuration(c.Tracking.IdleThreshold)
+	if err != nil {
+		return 5 * time.Minute
+	}
+	return d
+}
+
 func (c *Config) HealthCheckDuration() time.Duration {
 	d, err := time.ParseDuration(c.Twitter.HealthCheckInterval)
 	if err != nil {
@@ -97,7 +117,7 @@ func loadConfig(path string) (*Config, error) {
 
 	// Defaults
 	if cfg.Tracking.PollInterval == "" {
-		cfg.Tracking.PollInterval = "60s"
+		cfg.Tracking.PollInterval = "5s"
 	}
 	if cfg.Tracking.TweetsPerCheck == 0 {
 		cfg.Tracking.TweetsPerCheck = 5

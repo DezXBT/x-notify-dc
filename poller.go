@@ -8,15 +8,17 @@ import (
 )
 
 // Poller uses X's native /2/notifications/all.json endpoint.
-// Instead of polling each account individually (N requests), this fetches
-// ALL notifications in 1 request — same way X mobile/web works.
+// Supports two modes:
+//   - Real-time: WebSocket live_pipeline pushes → instant REST poll on event
+//   - Fallback: adaptive polling (5s active, 30s idle)
 type Poller struct {
-	cfg      *Config
-	watch    *WatchManager
-	state    *SeenState
-	clients  []*XClient
-	bot      *DiscordBot
+	cfg       *Config
+	watch     *WatchManager
+	state     *SeenState
+	clients   []*XClient
+	bot       *DiscordBot
 	clientIdx int
+	ws        *wsNotifier
 }
 
 func NewPoller(cfg *Config, watch *WatchManager, state *SeenState, clients []*XClient, bot *DiscordBot) *Poller {
@@ -36,12 +38,40 @@ func (p *Poller) nextClient() *XClient {
 }
 
 // Run starts the polling loop until ctx is cancelled.
+// Tries WebSocket first for real-time; falls back to adaptive polling.
 func (p *Poller) Run(ctx context.Context) {
-	interval := p.cfg.PollIntervalDuration()
-	logInfo("[poller] starting with notifications API, interval %s", interval)
-
 	// Warmup: follow + enable notif + seed baseline
 	p.warmup()
+
+	// Try WebSocket real-time mode
+	p.ws = newWSNotifier(p.cfg.Twitter.Cookies)
+	if p.ws.IsAvailable() {
+		if err := p.ws.Start(ctx, func() {
+			// WS push received → immediate REST poll
+			p.scanOnce()
+		}); err != nil {
+			logWarn("[poller] WebSocket unavailable, falling back to polling: %v", err)
+			p.runPolling(ctx)
+		} else {
+			// WS connected — still run periodic polling at idle interval as safety net
+			logInfo("[poller] real-time mode active, safety-net poll every %s", p.cfg.IdlePollIntervalDuration())
+			p.runSafetyNet(ctx)
+		}
+	} else {
+		p.runPolling(ctx)
+	}
+}
+
+// runPolling runs adaptive polling: fast interval when active, slow when idle.
+func (p *Poller) runPolling(ctx context.Context) {
+	baseInterval := p.cfg.PollIntervalDuration()
+	idleInterval := p.cfg.IdlePollIntervalDuration()
+	idleThreshold := p.cfg.IdleThresholdDuration()
+
+	interval := baseInterval
+	lastActivity := time.Now()
+
+	logInfo("[poller] starting adaptive polling: active=%s idle=%s threshold=%s", baseInterval, idleInterval, idleThreshold)
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -50,6 +80,9 @@ func (p *Poller) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			logInfo("[poller] stopping")
+			if p.ws != nil {
+				p.ws.Stop()
+			}
 			return
 		case <-ticker.C:
 			func() {
@@ -57,6 +90,45 @@ func (p *Poller) Run(ctx context.Context) {
 					if r := recover(); r != nil {
 						logError("[poller] recovered from panic: %v", r)
 						pollStats.TotalErrors++
+					}
+				}()
+				hadActivity := p.scanOnceWithResult()
+				if hadActivity {
+					lastActivity = time.Now()
+					if interval != baseInterval {
+						interval = baseInterval
+						ticker.Reset(interval)
+						logDebug("[poller] activity detected, switching to fast polling: %s", interval)
+					}
+				} else if time.Since(lastActivity) > idleThreshold && interval != idleInterval {
+					interval = idleInterval
+					ticker.Reset(interval)
+					logDebug("[poller] idle for %s, switching to slow polling: %s", idleThreshold, interval)
+				}
+			}()
+		}
+	}
+}
+
+// runSafetyNet runs periodic polling at idle interval as backup to WS.
+func (p *Poller) runSafetyNet(ctx context.Context) {
+	interval := p.cfg.IdlePollIntervalDuration()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			logInfo("[poller] stopping")
+			if p.ws != nil {
+				p.ws.Stop()
+			}
+			return
+		case <-ticker.C:
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						logError("[poller] recovered from panic: %v", r)
 					}
 				}()
 				p.scanOnce()
@@ -102,6 +174,11 @@ func (p *Poller) warmup() {
 
 // scanOnce fetches notifications from X and matches against watch list.
 func (p *Poller) scanOnce() {
+	p.scanOnceWithResult()
+}
+
+// scanOnceWithResult returns true if new notifications were found and processed.
+func (p *Poller) scanOnceWithResult() bool {
 	started := time.Now()
 	pollStats.TotalPolls++
 	pollStats.LastPollTime = started
@@ -110,7 +187,7 @@ func (p *Poller) scanOnce() {
 	entries := p.watch.GetAll()
 	if len(entries) == 0 {
 		logDebug("[poll] no watched accounts")
-		return
+		return false
 	}
 
 	// Build handle→entry map for fast lookup
@@ -130,12 +207,12 @@ func (p *Poller) scanOnce() {
 			logWarn("[poll] notifications: %v", err)
 		}
 		pollStats.TotalErrors++
-		return
+		return false
 	}
 
 	if page == nil || len(page.Tweets) == 0 {
 		logDebug("[poll] no new notifications")
-		return
+		return false
 	}
 
 	lastCursor := p.state.GetNotifCursor()
@@ -146,7 +223,7 @@ func (p *Poller) scanOnce() {
 	// there's nothing new. Notification IDs are stable (not comparable to tweet IDs).
 	if lastCursor == newCursor {
 		logDebug("[poll] no new notifications (cursor unchanged)")
-		return
+		return false
 	}
 
 	for _, tweet := range page.Tweets {
@@ -198,6 +275,7 @@ func (p *Poller) scanOnce() {
 
 	elapsed := time.Since(started)
 	logDebug("[poll] scan done: %d tweets matched from notifications in %s", matched, elapsed.Round(time.Millisecond))
+	return matched > 0
 }
 
 func isAuthError(err error) bool {
