@@ -1,0 +1,23 @@
+# x-notify-dc config
+discord:
+  bot_token: ""           # Discord bot token
+  guild_id: ""            # Optional: restrict to one server for instant slash commands
+
+twitter:
+  cookies:
+    - auth_token: ""
+      ct0: ""
+      label: "main"
+    # - auth_token: ""
+    #   ct0: ""
+    #   label: "backup"
+  health_check_interval: "5m"
+  alert_webhook: ""       # Discord webhook for cookie health alerts
+
+tracking:
+  poll_interval: "60s"
+  tweets_per_check: 5
+
+logging:
+  level: "info"
+  timezone: "Asia/Jakarta"
