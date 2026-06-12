@@ -581,22 +581,43 @@ func parseSingleTweet(result map[string]interface{}) *Tweet {
 		text = getString(legacy, "text")
 	}
 
-	// Get author info from core
+	// Get author info from core — X puts screen_name in result.core, not result.legacy
 	var authorName, authorHandle, avatarURL string
 	if core, ok := result["core"].(map[string]interface{}); ok {
 		if ur, ok := core["user_results"].(map[string]interface{}); ok {
 			if r, ok := ur["result"].(map[string]interface{}); ok {
-				if l, ok := r["legacy"].(map[string]interface{}); ok {
-					authorName = getString(l, "name")
-					authorHandle = getString(l, "screen_name")
-					avatarURL = getString(l, "profile_image_url_https")
+				// Try result.core first (new X format)
+				if uc, ok := r["core"].(map[string]interface{}); ok {
+					authorName = getString(uc, "name")
+					authorHandle = getString(uc, "screen_name")
+				}
+				// Fallback to result.legacy
+				if authorHandle == "" {
+					if l, ok := r["legacy"].(map[string]interface{}); ok {
+						authorName = getString(l, "name")
+						authorHandle = getString(l, "screen_name")
+					}
+				}
+				// Avatar from avatar.image_url or legacy.profile_image_url_https
+				if avatar, ok := r["avatar"].(map[string]interface{}); ok {
+					avatarURL = getString(avatar, "image_url")
+				}
+				if avatarURL == "" {
+					if l, ok := r["legacy"].(map[string]interface{}); ok {
+						avatarURL = getString(l, "profile_image_url_https")
+					}
 				}
 			}
 		}
 	}
 
-	// Check if retweet
+	// Check if retweet: text prefix OR retweeted_status_result in legacy
 	isRT := strings.HasPrefix(text, "RT @")
+	if !isRT {
+		if _, ok := legacy["retweeted_status_result"]; ok {
+			isRT = true
+		}
+	}
 
 	// Metrics
 	metrics := struct {
