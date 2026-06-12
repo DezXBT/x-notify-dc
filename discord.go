@@ -52,6 +52,60 @@ func (db *DiscordBot) Close() {
 func (db *DiscordBot) RegisterCommands(guildID string) error {
 	commands := []*discordgo.ApplicationCommand{
 		{
+			Name:        "cookie",
+			Description: "Manage X/Twitter cookies",
+			Options: []*discordgo.ApplicationCommandOption{
+				{
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+					Name:        "add",
+					Description: "Add a new X cookie pair",
+					Options: []*discordgo.ApplicationCommandOption{
+						{
+							Type:        discordgo.ApplicationCommandOptionString,
+							Name:        "auth_token",
+							Description: "auth_token cookie value",
+							Required:    true,
+						},
+						{
+							Type:        discordgo.ApplicationCommandOptionString,
+							Name:        "ct0",
+							Description: "ct0 cookie value",
+							Required:    true,
+						},
+						{
+							Type:        discordgo.ApplicationCommandOptionString,
+							Name:        "label",
+							Description: "Label for this cookie (e.g. main, backup)",
+							Required:    false,
+						},
+					},
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+					Name:        "remove",
+					Description: "Remove a cookie by label",
+					Options: []*discordgo.ApplicationCommandOption{
+						{
+							Type:        discordgo.ApplicationCommandOptionString,
+							Name:        "label",
+							Description: "Label of the cookie to remove",
+							Required:    true,
+						},
+					},
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+					Name:        "list",
+					Description: "Show all configured cookies (masked)",
+				},
+				{
+					Type:        discordgo.ApplicationCommandOptionSubCommand,
+					Name:        "health",
+					Description: "Check health of all cookies",
+				},
+			},
+		},
+		{
 			Name:        "setup",
 			Description: "Set the default notification channel",
 			Options: []*discordgo.ApplicationCommandOption{
@@ -154,6 +208,8 @@ func (db *DiscordBot) handleInteraction(s *discordgo.Session, i *discordgo.Inter
 
 	data := i.ApplicationCommandData()
 	switch data.Name {
+	case "cookie":
+		db.handleCookie(s, i, data)
 	case "setup":
 		db.handleSetup(s, i, data)
 	case "add":
@@ -167,6 +223,352 @@ func (db *DiscordBot) handleInteraction(s *discordgo.Session, i *discordgo.Inter
 	case "status":
 		db.handleStatus(s, i)
 	}
+}
+
+// ────────────────────────────────────────────────────────
+// /cookie
+// ────────────────────────────────────────────────────────
+
+func (db *DiscordBot) handleCookie(s *discordgo.Session, i *discordgo.InteractionCreate, data discordgo.ApplicationCommandInteractionData) {
+	if len(data.Options) == 0 {
+		respond(s, i, "❌ Use `/cookie add`, `/cookie remove`, `/cookie list`, or `/cookie health`")
+		return
+	}
+
+	sub := data.Options[0]
+	switch sub.Name {
+	case "add":
+		db.handleCookieAdd(s, i, sub)
+	case "remove":
+		db.handleCookieRemove(s, i, sub)
+	case "list":
+		db.handleCookieList(s, i)
+	case "health":
+		db.handleCookieHealth(s, i)
+	}
+}
+
+func (db *DiscordBot) handleCookieAdd(s *discordgo.Session, i *discordgo.InteractionCreate, sub *discordgo.ApplicationCommandInteractionDataOption) {
+	authToken := getSubStringOption(sub.Options, "auth_token")
+	ct0 := getSubStringOption(sub.Options, "ct0")
+	label := getSubStringOption(sub.Options, "label")
+
+	if authToken == "" || ct0 == "" {
+		respond(s, i, "❌ auth_token and ct0 are required.")
+		return
+	}
+	if label == "" {
+		label = fmt.Sprintf("cookie-%d", len(db.cfg.Twitter.Cookies)+1)
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	})
+
+	// Test the cookie
+	testClient := NewXClient(CookiePair{AuthToken: authToken, Ct0: ct0, Label: label})
+	if err := testClient.HealthCheck(); err != nil {
+		editResponse(s, i, fmt.Sprintf("❌ Cookie test failed: %v\nCookie NOT added.", err))
+		return
+	}
+
+	// Check for duplicate
+	for _, c := range db.cfg.Twitter.Cookies {
+		if c.AuthToken == authToken {
+			editResponse(s, i, "⚠️ This auth_token already exists in config.")
+			return
+		}
+	}
+
+	// Add to config
+	newCookie := CookiePair{AuthToken: authToken, Ct0: ct0, Label: label}
+	db.cfg.Twitter.Cookies = append(db.cfg.Twitter.Cookies, newCookie)
+	db.xClients = append(db.xClients, testClient)
+
+	// Update config.yaml
+	if err := addCookieToConfig(newCookie); err != nil {
+		logWarn("[cookie] failed to update config.yaml: %v", err)
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title: "✅ Cookie Added",
+		Color: 0x00FF00,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: "Label", Value: label, Inline: true},
+			{Name: "Auth Token", Value: maskString(authToken), Inline: true},
+			{Name: "CT0", Value: maskString(ct0), Inline: true},
+			{Name: "Health", Value: "✅ OK", Inline: true},
+			{Name: "Total Cookies", Value: fmt.Sprintf("%d", len(db.cfg.Twitter.Cookies)), Inline: true},
+		},
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: fmt.Sprintf("x-notify-dc | %s WIB", time.Now().In(db.cfg.Timezone()).Format("02/01/2006, 15:04:05")),
+		},
+	}
+
+	editResponseEmbed(s, i, embed)
+	logInfo("[cookie] added '%s' by %s", label, i.Member.User.Username)
+}
+
+func (db *DiscordBot) handleCookieRemove(s *discordgo.Session, i *discordgo.InteractionCreate, sub *discordgo.ApplicationCommandInteractionDataOption) {
+	label := getSubStringOption(sub.Options, "label")
+	if label == "" {
+		respond(s, i, "❌ Label is required.")
+		return
+	}
+
+	// Find and remove
+	found := false
+	var newCookies []CookiePair
+	var newClients []*XClient
+	for idx, c := range db.cfg.Twitter.Cookies {
+		if c.Label == label {
+			found = true
+			continue
+		}
+		newCookies = append(newCookies, c)
+		if idx < len(db.xClients) {
+			newClients = append(newClients, db.xClients[idx])
+		}
+	}
+
+	if !found {
+		respond(s, i, fmt.Sprintf("❌ Cookie with label '%s' not found.", label))
+		return
+	}
+
+	// Can't remove last cookie
+	if len(newCookies) == 0 {
+		respond(s, i, "❌ Cannot remove the last cookie. Bot needs at least one.")
+		return
+	}
+
+	db.cfg.Twitter.Cookies = newCookies
+	db.xClients = newClients
+
+	// Update config.yaml
+	if err := removeCookieFromConfig(label); err != nil {
+		logWarn("[cookie] failed to update config.yaml: %v", err)
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:       "✅ Cookie Removed",
+		Description: fmt.Sprintf("Cookie '%s' has been removed.", label),
+		Color:       0xFF6B6B,
+		Fields: []*discordgo.MessageEmbedField{
+			{Name: "Remaining", Value: fmt.Sprintf("%d cookie(s)", len(db.cfg.Twitter.Cookies)), Inline: true},
+		},
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: fmt.Sprintf("x-notify-dc | %s WIB", time.Now().In(db.cfg.Timezone()).Format("02/01/2006, 15:04:05")),
+		},
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{embed},
+		},
+	})
+	logInfo("[cookie] removed '%s' by %s", label, i.Member.User.Username)
+}
+
+func (db *DiscordBot) handleCookieList(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	if len(db.cfg.Twitter.Cookies) == 0 {
+		respond(s, i, "📭 No cookies configured.")
+		return
+	}
+
+	var fields []*discordgo.MessageEmbedField
+	for idx, c := range db.cfg.Twitter.Cookies {
+		label := c.Label
+		if label == "" {
+			label = fmt.Sprintf("cookie-%d", idx+1)
+		}
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name:   fmt.Sprintf("%d. %s", idx+1, label),
+			Value:  fmt.Sprintf("Auth: `%s`\nCT0: `%s`", maskString(c.AuthToken), maskString(c.Ct0)),
+			Inline: false,
+		})
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:  fmt.Sprintf("🍪 Configured Cookies (%d)", len(db.cfg.Twitter.Cookies)),
+		Color:  0x1DA1F2,
+		Fields: fields,
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: fmt.Sprintf("x-notify-dc | %s WIB", time.Now().In(db.cfg.Timezone()).Format("02/01/2006, 15:04:05")),
+		},
+	}
+
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseChannelMessageWithSource,
+		Data: &discordgo.InteractionResponseData{
+			Embeds: []*discordgo.MessageEmbed{embed},
+		},
+	})
+}
+
+func (db *DiscordBot) handleCookieHealth(s *discordgo.Session, i *discordgo.InteractionCreate) {
+	s.InteractionRespond(i.Interaction, &discordgo.InteractionResponse{
+		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
+	})
+
+	var fields []*discordgo.MessageEmbedField
+	alive := 0
+
+	for idx, xc := range db.xClients {
+		label := xc.label
+		if label == "" {
+			label = fmt.Sprintf("cookie-%d", idx+1)
+		}
+
+		status := "✅ OK"
+		if err := xc.HealthCheck(); err != nil {
+			status = fmt.Sprintf("❌ %v", err)
+		} else {
+			alive++
+		}
+
+		fields = append(fields, &discordgo.MessageEmbedField{
+			Name:   label,
+			Value:  status,
+			Inline: true,
+		})
+	}
+
+	color := 0x00FF00
+	if alive == 0 {
+		color = 0xFF0000
+	} else if alive < len(db.xClients) {
+		color = 0xFFAA00
+	}
+
+	embed := &discordgo.MessageEmbed{
+		Title:  fmt.Sprintf("🏥 Cookie Health (%d/%d alive)", alive, len(db.xClients)),
+		Color:  color,
+		Fields: fields,
+		Footer: &discordgo.MessageEmbedFooter{
+			Text: fmt.Sprintf("x-notify-dc | %s WIB", time.Now().In(db.cfg.Timezone()).Format("02/01/2006, 15:04:05")),
+		},
+	}
+
+	editResponseEmbed(s, i, embed)
+}
+
+// ────────────────────────────────────────────────────────
+// Cookie Config Helpers
+// ────────────────────────────────────────────────────────
+
+func addCookieToConfig(cookie CookiePair) error {
+	return updateConfigYAML(func(content string) string {
+		// Find the last cookie entry and append after it
+		// Simple approach: find "cookies:" section and add entry
+		lines := strings.Split(content, "\n")
+		var result []string
+		inCookies := false
+		lastCookieIdx := -1
+
+		for idx, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "cookies:") {
+				inCookies = true
+			}
+			if inCookies && strings.HasPrefix(trimmed, "- auth_token:") {
+				lastCookieIdx = idx
+			}
+			result = append(result, line)
+		}
+
+		if lastCookieIdx >= 0 {
+			// Insert new cookie after last one
+			newEntry := []string{
+				fmt.Sprintf("    - auth_token: \"%s\"", cookie.AuthToken),
+				fmt.Sprintf("      ct0: \"%s\"", cookie.Ct0),
+			}
+			if cookie.Label != "" {
+				newEntry = append(newEntry, fmt.Sprintf("      label: \"%s\"", cookie.Label))
+			}
+			// Insert after lastCookieIdx
+			var final []string
+			final = append(final, result[:lastCookieIdx+1]...)
+			final = append(final, newEntry...)
+			final = append(final, result[lastCookieIdx+1:]...)
+			return strings.Join(final, "\n")
+		}
+		return content
+	})
+}
+
+func removeCookieFromConfig(label string) error {
+	return updateConfigYAML(func(content string) string {
+		lines := strings.Split(content, "\n")
+		var result []string
+		skipUntilNext := false
+
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+
+			// Detect start of cookie block with matching label
+			if strings.HasPrefix(trimmed, "- auth_token:") && !skipUntilNext {
+				// Check if next non-empty line has our label
+				// For now, just mark for potential skip
+				skipUntilNext = false // reset
+			}
+
+			// Check for label line
+			if strings.HasPrefix(trimmed, "label:") && strings.Contains(trimmed, label) {
+				// Remove this entire block - go back and remove the auth_token line too
+				if len(result) > 0 {
+					result = result[:len(result)-1] // remove the "- auth_token:" line
+				}
+				continue // skip this label line
+			}
+
+			// Check if this is a ct0 line right after we might have removed something
+			if strings.HasPrefix(trimmed, "ct0:") && len(result) > 0 {
+				prevTrimmed := strings.TrimSpace(result[len(result)-1])
+				// If previous line was removed (or is another cookie), this ct0 is orphaned
+				if !strings.HasPrefix(prevTrimmed, "auth_token:") {
+					continue // skip orphaned ct0
+				}
+			}
+
+			result = append(result, line)
+		}
+		return strings.Join(result, "\n")
+	})
+}
+
+func updateConfigYAML(transform func(string) string) error {
+	path := "config.yaml"
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	newContent := transform(string(data))
+	return os.WriteFile(path, []byte(newContent), 0644)
+}
+
+func maskString(s string) string {
+	if len(s) <= 8 {
+		return "***"
+	}
+	return s[:4] + "..." + s[len(s)-4:]
+}
+
+func getSubStringOption(options []*discordgo.ApplicationCommandInteractionDataOption, name string) string {
+	for _, opt := range options {
+		if opt.Name == name {
+			return opt.StringValue()
+		}
+	}
+	return ""
+}
+
+func editResponseEmbed(s *discordgo.Session, i *discordgo.InteractionCreate, embed *discordgo.MessageEmbed) {
+	embeds := []*discordgo.MessageEmbed{embed}
+	s.InteractionResponseEdit(i.Interaction, &discordgo.WebhookEdit{
+		Embeds: &embeds,
+	})
 }
 
 // ────────────────────────────────────────────────────────
