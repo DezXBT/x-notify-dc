@@ -7,10 +7,11 @@ import (
 	"time"
 )
 
-// SeenState tracks last-seen tweet IDs per account and cookie hash for re-sync detection.
+// SeenState tracks last-seen notification cursor + per-account tweet IDs.
 type SeenState struct {
 	CookieHash  string            `json:"cookie_hash"`
-	LastTweetID map[string]string `json:"last_tweet_id"` // handle (lower) -> last tweet ID
+	NotifCursor string            `json:"notif_cursor,omitempty"` // most recent notification ID
+	LastTweetID map[string]string `json:"last_tweet_id"`          // handle (lower) -> last tweet ID (backup)
 	UpdatedAt   time.Time         `json:"updated_at"`
 	mu          sync.RWMutex
 	path        string
@@ -31,6 +32,9 @@ func (s *SeenState) load() {
 		return
 	}
 	_ = json.Unmarshal(data, s)
+	if s.LastTweetID == nil {
+		s.LastTweetID = make(map[string]string)
+	}
 }
 
 func (s *SeenState) Save() {
@@ -47,6 +51,22 @@ func (s *SeenState) Save() {
 	}
 }
 
+// ── Notification cursor (primary dedup mechanism) ──
+
+func (s *SeenState) GetNotifCursor() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.NotifCursor
+}
+
+func (s *SeenState) SetNotifCursor(cursor string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.NotifCursor = cursor
+}
+
+// ── Per-account tweet ID (backup / compatibility) ──
+
 func (s *SeenState) GetLastTweetID(handle string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -58,6 +78,8 @@ func (s *SeenState) SetLastTweetID(handle, tweetID string) {
 	defer s.mu.Unlock()
 	s.LastTweetID[handle] = tweetID
 }
+
+// ── Cookie hash ──
 
 func (s *SeenState) SetCookieHash(hash string) {
 	s.mu.Lock()
