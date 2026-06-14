@@ -872,11 +872,12 @@ func (db *DiscordBot) handleSettings(s *discordgo.Session, i *discordgo.Interact
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 	})
 
-	// Update notification on X
-	xc := db.nextClient()
-	if err := xc.SetNotifications(entry.Handle, mode); err != nil {
-		editResponse(s, i, fmt.Sprintf("❌ Failed to update notifications for **@%s**: %v", entry.Handle, err))
-		return
+	// Update notification on X — ALL accounts
+	for _, xc := range db.xClients {
+		if err := xc.SetNotifications(entry.Handle, mode); err != nil {
+			logWarn("[settings] %s notif @%s (%s): %v", xc.label, entry.Handle, mode, err)
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
 
 	db.watch.UpdateNotifyMode(handle, mode)
