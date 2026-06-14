@@ -158,8 +158,148 @@ func (xc *XClient) GetUserTweets(userID string, count int) ([]Tweet, error) {
 	return parseTweets(data, userID)
 }
 
+// GetUserReplies fetches reply tweets via GraphQL SearchTimeline.
+// Uses `from:{handle}` search which returns ALL tweets including replies to others.
+// device_follow.json doesn't include replies, so this is the supplementary mechanism
+// for all+replies mode.
+func (xc *XClient) GetUserReplies(screenName string, count int) ([]Tweet, error) {
+	if count <= 0 {
+		count = 20
+	}
+	variables := map[string]interface{}{
+		"rawQuery":    fmt.Sprintf("from:%s", screenName),
+		"count":       count,
+		"querySource": "typed_query",
+		"product":     "Latest",
+	}
+
+	qid, ok := queryID("SearchTimeline")
+	if !ok {
+		return nil, fmt.Errorf("SearchTimeline query ID not available")
+	}
+
+	// Build POST body with features
+	body := map[string]interface{}{
+		"variables": variables,
+		"features":  defaultFeatures,
+	}
+	bodyJSON, _ := json.Marshal(body)
+
+	u := fmt.Sprintf("https://x.com/i/api/graphql/%s/SearchTimeline", qid)
+	req, err := http.NewRequest("POST", u, strings.NewReader(string(bodyJSON)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header = xc.getHeaders()
+	if TxGen != nil {
+		if txID := Generate(req.Method, req.URL.Path); txID != "" {
+			req.Header.Set("x-client-transaction-id", txID)
+		}
+	}
+	if req.Header.Get("x-client-transaction-id") == "" {
+		req.Header.Set("x-client-transaction-id", fallbackTransactionID())
+	}
+
+	resp, err := xc.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 401 {
+		return nil, fmt.Errorf("unauthorized (401)")
+	}
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+
+	// Navigate: data -> search_by_raw_query -> search_timeline -> timeline -> instructions
+	data, _ := raw["data"].(map[string]interface{})
+	if data == nil {
+		return nil, fmt.Errorf("no data in SearchTimeline response")
+	}
+	searchByType, _ := data["search_by_raw_query"].(map[string]interface{})
+	if searchByType == nil {
+		return nil, fmt.Errorf("no search_by_raw_query")
+	}
+	searchTL, _ := searchByType["search_timeline"].(map[string]interface{})
+	if searchTL == nil {
+		return nil, fmt.Errorf("no search_timeline")
+	}
+	timeline, _ := searchTL["timeline"].(map[string]interface{})
+	if timeline == nil {
+		return nil, fmt.Errorf("no timeline")
+	}
+	instructions, _ := timeline["instructions"].([]interface{})
+
+	var tweets []Tweet
+	for _, inst := range instructions {
+		m, ok := inst.(map[string]interface{})
+		if !ok || m["type"] != "TimelineAddEntries" {
+			continue
+		}
+		entries, _ := m["entries"].([]interface{})
+		for _, entry := range entries {
+			e, ok := entry.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			content, _ := e["content"].(map[string]interface{})
+			if content == nil || content["entryType"] != "TimelineTimelineItem" {
+				continue
+			}
+			itemContent, _ := content["itemContent"].(map[string]interface{})
+			if itemContent == nil {
+				continue
+			}
+			tweetResults, _ := itemContent["tweet_results"].(map[string]interface{})
+			if tweetResults == nil {
+				continue
+			}
+			result, _ := tweetResults["result"].(map[string]interface{})
+			if result == nil {
+				continue
+			}
+			tweet := parseSingleTweet(result)
+			if tweet == nil {
+				continue
+			}
+
+			// Only include actual replies (in_reply_to set)
+			// We need to check the raw legacy for in_reply_to_status_id_str
+			legacy, _ := result["legacy"].(map[string]interface{})
+			if legacy == nil {
+				continue
+			}
+			inReplyTo, _ := legacy["in_reply_to_status_id_str"].(string)
+			if inReplyTo == "" {
+				continue // skip non-reply tweets
+			}
+
+			tweets = append(tweets, *tweet)
+		}
+	}
+
+	// Sort by ID descending
+	sort.Slice(tweets, func(i, j int) bool {
+		return tweets[i].ID > tweets[j].ID
+	})
+
+	return tweets, nil
+}
+
 // ────────────────────────────────────────────────────────
-// REST: Follow / Unfollow
+// REST: Notification Settings
 // ────────────────────────────────────────────────────────
 
 const restBase = "https://api.x.com"

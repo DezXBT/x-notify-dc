@@ -308,6 +308,9 @@ func (p *Poller) scanOnceWithResult() bool {
 		p.state.Save()
 	}
 
+	// Supplementary: scan replies for accounts with all+replies mode
+	p.scanReplies(entries)
+
 	elapsed := time.Since(started)
 	logDebug("[poll] scan done: %d new tweets found in %s (device_follow)", matched, elapsed.Round(time.Millisecond))
 	return matched > 0
@@ -371,6 +374,68 @@ func (p *Poller) scanOncePerAccount() bool {
 		p.state.Save()
 	}
 	return matched > 0
+}
+
+// scanReplies checks for new reply tweets from accounts with all+replies mode.
+// device_follow.json doesn't include replies, so we use REST v1.1 user_timeline
+// as a supplementary scan.
+func (p *Poller) scanReplies(entries []WatchEntry) {
+	for _, entry := range entries {
+		if entry.NotifyMode != "all+replies" {
+			continue
+		}
+		if entry.UserID == "" {
+			continue
+		}
+
+		xc := p.nextClient()
+		replies, err := xc.GetUserReplies(entry.Handle, 20)
+		if err != nil {
+			if isAuthError(err) {
+				logError("[replies] auth error for @%s: %v", entry.Handle, err)
+			} else {
+				logWarn("[replies] @%s: %v", entry.Handle, err)
+			}
+			continue
+		}
+
+		if len(replies) == 0 {
+			continue
+		}
+
+		lastReplyID := p.state.GetLastReplyID(strings.ToLower(entry.Handle))
+		saved := false
+
+		for _, reply := range replies {
+			if lastReplyID != "" && reply.ID <= lastReplyID {
+				break
+			}
+
+			if err := p.bot.SendTweetNotification(entry.ChannelID, reply, entry.Handle); err != nil {
+				logError("[replies] @%s reply %s: %v", entry.Handle, reply.ID, err)
+			} else {
+				logInfo("[replies] @%s → reply %s sent", entry.Handle, reply.ID)
+				pollStats.TotalTweets++
+			}
+			saved = true
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		if len(replies) > 0 {
+			newestID := replies[0].ID
+			current := p.state.GetLastReplyID(strings.ToLower(entry.Handle))
+			if current == "" || newestID > current {
+				p.state.SetLastReplyID(strings.ToLower(entry.Handle), newestID)
+				saved = true
+			}
+		}
+
+		if saved {
+			p.state.Save()
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 func isAuthError(err error) bool {

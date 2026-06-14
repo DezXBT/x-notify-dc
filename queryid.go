@@ -18,6 +18,7 @@ var (
 		"Following":        "zx6e-TLzRkeDO_a7p4b3JQ",
 		"Followers":        "IOh4aS6UdGWGJUYTqliQ7Q",
 		"UserTweets":       "PNd0vlufvrcIwrAnBYKE9g",
+		"SearchTimeline":   "yIphfmxUO-hddQHKIOk9tA",
 	}
 )
 

@@ -12,6 +12,7 @@ type SeenState struct {
 	CookieHash  string            `json:"cookie_hash"`
 	NotifCursor string            `json:"notif_cursor,omitempty"` // most recent notification ID
 	LastTweetID map[string]string `json:"last_tweet_id"`          // handle (lower) -> last tweet ID (backup)
+	LastReplyID map[string]string `json:"last_reply_id,omitempty"` // handle (lower) -> last reply tweet ID
 	UpdatedAt   time.Time         `json:"updated_at"`
 	mu          sync.RWMutex
 	path        string
@@ -20,6 +21,7 @@ type SeenState struct {
 func NewSeenState(path string) *SeenState {
 	s := &SeenState{
 		LastTweetID: make(map[string]string),
+		LastReplyID: make(map[string]string),
 		path:        path,
 	}
 	s.load()
@@ -34,6 +36,9 @@ func (s *SeenState) load() {
 	_ = json.Unmarshal(data, s)
 	if s.LastTweetID == nil {
 		s.LastTweetID = make(map[string]string)
+	}
+	if s.LastReplyID == nil {
+		s.LastReplyID = make(map[string]string)
 	}
 }
 
@@ -77,6 +82,20 @@ func (s *SeenState) SetLastTweetID(handle, tweetID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.LastTweetID[handle] = tweetID
+}
+
+// ── Per-account reply ID (for all+replies mode) ──
+
+func (s *SeenState) GetLastReplyID(handle string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.LastReplyID[handle]
+}
+
+func (s *SeenState) SetLastReplyID(handle, replyID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.LastReplyID[handle] = replyID
 }
 
 // ── Cookie hash ──
