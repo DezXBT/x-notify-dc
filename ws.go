@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -106,6 +107,9 @@ func (w *wsNotifier) connect(ctx context.Context) error {
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 15 * time.Second,
+		NetDialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return newUTLSRoundTripper().dialUTLS(ctx, addr, []string{"http/1.1"})
+		},
 	}
 
 	conn, resp, err := dialer.DialContext(ctx, endpoint, header)
@@ -158,7 +162,7 @@ func (w *wsNotifier) subscribe() error {
 
 // getUserID calls verify_credentials to get the user ID for a cookie pair.
 func (w *wsNotifier) getUserID(c CookiePair) (string, error) {
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := newUTLSClient(10 * time.Second)
 	req, err := http.NewRequest("GET", "https://api.x.com/1.1/account/verify_credentials.json", nil)
 	if err != nil {
 		return "", err

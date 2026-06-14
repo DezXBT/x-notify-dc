@@ -682,6 +682,22 @@ func (db *DiscordBot) handleAdd(s *discordgo.Session, i *discordgo.InteractionCr
 		logWarn("[add] enable notif @%s failed: %v", handle, err)
 	}
 
+	// Follow+bell with ALL remaining clients (resilience: if primary cookie dies, others have data)
+	for _, other := range db.xClients {
+		if other == xc {
+			continue // already did this one above
+		}
+		if err := other.Follow(handle); err != nil {
+			if !strings.Contains(err.Error(), "403") {
+				logWarn("[add] %s follow @%s: %v", other.label, handle, err)
+			}
+		}
+		if err := other.SetNotifications(handle, "all"); err != nil {
+			logWarn("[add] %s notif @%s: %v", other.label, handle, err)
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+
 	// Seed baseline (get last tweet ID to avoid alerting old tweets)
 	var lastTweetID string
 	if tweets, err := xc.GetUserTweets(user.RestID, 1); err == nil && len(tweets) > 0 {
@@ -766,13 +782,17 @@ func (db *DiscordBot) handleRemove(s *discordgo.Session, i *discordgo.Interactio
 		Type: discordgo.InteractionResponseDeferredChannelMessageWithSource,
 	})
 
-	// Unfollow + disable notifications
-	xc := db.nextClient()
-	if err := xc.Unfollow(entry.Handle); err != nil {
-		logWarn("[remove] unfollow @%s: %v", entry.Handle, err)
-	}
-	if err := xc.SetNotifications(entry.Handle, "off"); err != nil {
-		logWarn("[remove] disable notif @%s: %v", entry.Handle, err)
+	// Unfollow + disable notifications from ALL clients
+	for _, xc := range db.xClients {
+		if err := xc.Unfollow(entry.Handle); err != nil {
+			if !strings.Contains(err.Error(), "404") {
+				logWarn("[remove] %s unfollow @%s: %v", xc.label, entry.Handle, err)
+			}
+		}
+		if err := xc.SetNotifications(entry.Handle, "off"); err != nil {
+			logWarn("[remove] %s disable notif @%s: %v", xc.label, entry.Handle, err)
+		}
+		time.Sleep(300 * time.Millisecond)
 	}
 
 	db.watch.Remove(handle)
@@ -938,7 +958,7 @@ func (db *DiscordBot) SendTweetNotification(channelID string, tweet Tweet, watch
 	// Build embed
 	embed := &discordgo.MessageEmbed{
 		URL:   tweet.TweetURL,
-		Color: 0x1DA1F2,
+		Color: 0xFFD700,
 	}
 
 	if tweet.IsRetweet {
@@ -957,7 +977,7 @@ func (db *DiscordBot) SendTweetNotification(channelID string, tweet Tweet, watch
 		}
 	}
 
-	embed.Description = tweet.Text
+	embed.Description = fmt.Sprintf("%s\n\n🔗 [View on X](%s)", tweet.Text, tweet.TweetURL)
 
 	// Metrics field
 	var metricsParts []string

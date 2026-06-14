@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 )
@@ -68,9 +69,7 @@ func NewXClient(cookies CookiePair) *XClient {
 	}
 	return &XClient{
 		cookies: cookies,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
+		client:  newUTLSClient(30 * time.Second),
 		rateLimit: make(map[string]rateInfo),
 		label:     label,
 	}
@@ -314,6 +313,204 @@ func (xc *XClient) GetNotifications(screenName string) (enabled bool, allReplies
 func (xc *XClient) HealthCheck() error {
 	_, _, err := xc.GetNotifications("twitter")
 	return err
+}
+
+// ────────────────────────────────────────────────────────
+// REST: Device Follow Notifications (Bell)
+// ────────────────────────────────────────────────────────
+
+// DeviceFollowTweet is a tweet from /2/notifications/device_follow.json.
+type DeviceFollowTweet struct {
+	ID        string
+	Text      string
+	CreatedAt string
+	UserID    string
+	// Parsed author info from globalObjects.users
+	Author struct {
+		Name       string
+		ScreenName string
+		AvatarURL  string
+	}
+	Metrics struct {
+		Likes    int
+		Retweets int
+		Replies  int
+		Views    int
+	}
+	MediaURLs []string
+	URLs      []string
+	IsRetweet bool
+	TweetURL  string
+}
+
+// GetDeviceFollowTweets fetches tweets from bell-enabled accounts via
+// /2/notifications/device_follow.json. Returns all tweets in the response,
+// which are tweets from accounts the auth user has bell notifications enabled for.
+// This is a single API call that covers ALL bell-enabled accounts at once.
+func (xc *XClient) GetDeviceFollowTweets(count int) ([]DeviceFollowTweet, error) {
+	if count <= 0 {
+		count = 40
+	}
+	u := fmt.Sprintf("%s/2/notifications/device_follow.json?count=%d", restBase, count)
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header = xc.getHeaders()
+	// Override content-type for GET
+	req.Header.Set("content-type", "application/x-www-form-urlencoded")
+
+	if TxGen != nil {
+		if txID := Generate(req.Method, req.URL.Path); txID != "" {
+			req.Header.Set("x-client-transaction-id", txID)
+		}
+	}
+	if req.Header.Get("x-client-transaction-id") == "" {
+		req.Header.Set("x-client-transaction-id", fallbackTransactionID())
+	}
+
+	resp, err := xc.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		return nil, fmt.Errorf("unauthorized (401) — cookie may be expired")
+	}
+	if resp.StatusCode == 429 {
+		return nil, fmt.Errorf("rate limited (429)")
+	}
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 500))
+		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	}
+
+	bodyBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read body: %w", err)
+	}
+
+	var raw map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &raw); err != nil {
+		return nil, fmt.Errorf("parse JSON: %w", err)
+	}
+
+	globalObjects, _ := raw["globalObjects"].(map[string]interface{})
+	if globalObjects == nil {
+		return nil, fmt.Errorf("missing globalObjects in response")
+	}
+
+	tweetsMap, _ := globalObjects["tweets"].(map[string]interface{})
+	usersMap, _ := globalObjects["users"].(map[string]interface{})
+
+	var tweets []DeviceFollowTweet
+	for tweetID, tweetRaw := range tweetsMap {
+		t, ok := tweetRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+
+		text := getString(t, "full_text")
+		if text == "" {
+			text = getString(t, "text")
+		}
+		userIDStr := getString(t, "user_id_str")
+		createdAt := getString(t, "created_at")
+
+		isRT := strings.HasPrefix(text, "RT @")
+		if !isRT {
+			if _, ok := t["retweeted_status"]; ok {
+				isRT = true
+			}
+		}
+
+		dft := DeviceFollowTweet{
+			ID:        tweetID,
+			Text:      text,
+			UserID:    userIDStr,
+			CreatedAt: createdAt,
+			IsRetweet: isRT,
+		}
+
+		// Metrics
+		dft.Metrics.Likes = getInt(t, "favorite_count")
+		dft.Metrics.Retweets = getInt(t, "retweet_count")
+		dft.Metrics.Replies = getInt(t, "reply_count")
+
+		// Author info from users map
+		if user, ok := usersMap[userIDStr].(map[string]interface{}); ok {
+			dft.Author.Name = getString(user, "name")
+			dft.Author.ScreenName = getString(user, "screen_name")
+			dft.Author.AvatarURL = getString(user, "profile_image_url_https")
+		}
+
+		dft.TweetURL = fmt.Sprintf("https://x.com/%s/status/%s", dft.Author.ScreenName, tweetID)
+
+		// Media URLs
+		if entities, ok := t["entities"].(map[string]interface{}); ok {
+			if media, ok := entities["media"].([]interface{}); ok {
+				for _, m := range media {
+					if mm, ok := m.(map[string]interface{}); ok {
+						if u := getString(mm, "media_url_https"); u != "" {
+							dft.MediaURLs = append(dft.MediaURLs, u)
+						}
+					}
+				}
+			}
+			if urlList, ok := entities["urls"].([]interface{}); ok {
+				for _, u := range urlList {
+					if uu, ok := u.(map[string]interface{}); ok {
+						if expanded := getString(uu, "expanded_url"); expanded != "" {
+							dft.URLs = append(dft.URLs, expanded)
+						}
+					}
+				}
+			}
+		}
+
+		tweets = append(tweets, dft)
+	}
+
+	// Sort by ID descending (newest first)
+	sort.Slice(tweets, func(i, j int) bool {
+		return tweets[i].ID > tweets[j].ID
+	})
+
+	return tweets, nil
+}
+
+// ToTweet converts a DeviceFollowTweet to a Tweet for compatibility with SendTweetNotification.
+func (dft *DeviceFollowTweet) ToTweet() Tweet {
+	return Tweet{
+		ID:        dft.ID,
+		Text:      dft.Text,
+		CreatedAt: dft.CreatedAt,
+		Author: struct {
+			Name       string `json:"name"`
+			ScreenName string `json:"screenName"`
+			AvatarURL  string `json:"avatarUrl"`
+		}{
+			Name:       dft.Author.Name,
+			ScreenName: dft.Author.ScreenName,
+			AvatarURL:  dft.Author.AvatarURL,
+		},
+		Metrics: struct {
+			Likes    int `json:"likes"`
+			Retweets int `json:"retweets"`
+			Replies  int `json:"replies"`
+			Views    int `json:"views"`
+		}{
+			Likes:    dft.Metrics.Likes,
+			Retweets: dft.Metrics.Retweets,
+			Replies:  dft.Metrics.Replies,
+			Views:    dft.Metrics.Views,
+		},
+		MediaURLs: dft.MediaURLs,
+		URLs:      dft.URLs,
+		IsRetweet: dft.IsRetweet,
+		TweetURL:  dft.TweetURL,
+	}
 }
 
 // ────────────────────────────────────────────────────────

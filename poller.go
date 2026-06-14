@@ -137,12 +137,10 @@ func (p *Poller) runSafetyNet(ctx context.Context) {
 	}
 }
 
-// warmup seeds the notification cursor and ensures all watched accounts
-// are followed with notifications enabled.
+// warmup resolves user IDs for watched accounts.
 func (p *Poller) warmup() {
 	entries := p.watch.GetAll()
 	for _, entry := range entries {
-		// Resolve user ID if missing
 		if entry.UserID == "" {
 			xc := p.nextClient()
 			user, err := xc.GetUser(entry.Handle)
@@ -156,20 +154,54 @@ func (p *Poller) warmup() {
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	// Seed cursor: fetch one page of notifications to establish baseline
-	if p.state.GetNotifCursor() == "" {
-		xc := p.nextClient()
-		page, err := xc.FetchNotifications("all", 20, "")
-		if err != nil {
-			logWarn("[warmup] fetch notifications: %v", err)
-		} else if page != nil && len(page.NotifIDs) > 0 {
-			// Store the most recent notification ID as cursor
-			p.state.SetNotifCursor(page.NotifIDs[0])
-			logInfo("[warmup] seeded notification cursor: %s", page.NotifIDs[0])
+	// Ensure ALL clients follow+bell to ALL watched accounts (resilience)
+	p.ensureAllFollowed(entries)
+
+	// Seed baseline: get latest tweet ID per watched account to avoid alerting old tweets
+	for _, entry := range entries {
+		if entry.UserID == "" {
+			continue
 		}
+		xc := p.clients[0] // use first client for baseline seed
+		tweets, err := xc.GetUserTweets(entry.UserID, 1)
+		if err != nil {
+			logWarn("[warmup] fetch @%s timeline: %v", entry.Handle, err)
+			continue
+		}
+		if len(tweets) > 0 {
+			current := p.state.GetLastTweetID(strings.ToLower(entry.Handle))
+			if current == "" || tweets[0].ID > current {
+				p.state.SetLastTweetID(strings.ToLower(entry.Handle), tweets[0].ID)
+				logInfo("[warmup] seeded @%s baseline: tweet %s", entry.Handle, tweets[0].ID)
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 
 	p.state.Save()
+}
+
+// ensureAllFollowed makes every cookie account follow+bell every watched target.
+// This ensures device_follow.json always returns data regardless of which client is used.
+func (p *Poller) ensureAllFollowed(entries []WatchEntry) {
+	for _, entry := range entries {
+		if entry.UserID == "" {
+			continue
+		}
+		for _, xc := range p.clients {
+			// Follow (ignore "already following" errors)
+			if err := xc.Follow(entry.Handle); err != nil {
+				if !strings.Contains(err.Error(), "403") {
+					logWarn("[warmup] %s follow @%s: %v", xc.label, entry.Handle, err)
+				}
+			}
+			// Enable bell notifications
+			if err := xc.SetNotifications(entry.Handle, entry.NotifyMode); err != nil {
+				logWarn("[warmup] %s notif @%s: %v", xc.label, entry.Handle, err)
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
 }
 
 // scanOnce fetches notifications from X and matches against watch list.
@@ -177,12 +209,14 @@ func (p *Poller) scanOnce() {
 	p.scanOnceWithResult()
 }
 
-// scanOnceWithResult returns true if new notifications were found and processed.
+// scanOnceWithResult returns true if new tweets were found and processed.
+// Uses /2/notifications/device_follow.json for efficient single-call detection
+// of new tweets from all bell-enabled accounts, with per-account UserTweets fallback.
 func (p *Poller) scanOnceWithResult() bool {
 	started := time.Now()
 	pollStats.TotalPolls++
 	pollStats.LastPollTime = started
-	logDebug("[poll] scan starting")
+	logDebug("[poll] scan starting (device_follow mode)")
 
 	entries := p.watch.GetAll()
 	if len(entries) == 0 {
@@ -190,91 +224,152 @@ func (p *Poller) scanOnceWithResult() bool {
 		return false
 	}
 
-	// Build handle→entry map for fast lookup
-	watchMap := make(map[string]WatchEntry, len(entries))
-	for _, e := range entries {
-		watchMap[strings.ToLower(e.Handle)] = e
-	}
-
-	// Single API call for ALL notifications
-	xc := p.nextClient()
-	logDebug("[poll] fetching notifications...")
-	page, err := xc.FetchNotifications("all", 40, "")
-	if err != nil {
-		if isAuthError(err) {
-			logError("[poll] auth error: %v (cookie may be expired)", err)
-		} else {
-			logWarn("[poll] notifications: %v", err)
+	// Build lookup: userID -> []WatchEntry (one user can be in multiple channels)
+	userEntries := make(map[string][]WatchEntry)
+	for _, entry := range entries {
+		if entry.UserID != "" {
+			userEntries[entry.UserID] = append(userEntries[entry.UserID], entry)
 		}
-		pollStats.TotalErrors++
-		return false
 	}
 
-	if page == nil || len(page.Tweets) == 0 {
-		logDebug("[poll] no new notifications")
-		return false
-	}
-
-	lastCursor := p.state.GetNotifCursor()
-	newCursor := page.NotifIDs[0] // most recent notification ID
 	matched := 0
 
-	// Quick check: if the most recent notification hasn't changed since last poll,
-	// there's nothing new. Notification IDs are stable (not comparable to tweet IDs).
-	if lastCursor == newCursor {
-		logDebug("[poll] no new notifications (cursor unchanged)")
-		return false
-	}
-
-	for _, tweet := range page.Tweets {
-		handle := strings.ToLower(tweet.Author.ScreenName)
-		entry, watched := watchMap[handle]
-		if !watched {
-			continue
-		}
-
-		// Skip duplicates using per-account last tweet ID (numeric comparison)
-		lastTweetID := p.state.GetLastTweetID(handle)
-		if lastTweetID != "" && tweet.ID <= lastTweetID {
-			continue
-		}
-
-		// Skip retweets if mode is not all+replies
-		if tweet.IsRetweet && entry.NotifyMode != "all+replies" {
-			continue
-		}
-
-		matched++
-		if err := p.bot.SendTweetNotification(entry.ChannelID, tweet, entry.Handle); err != nil {
-			logError("[notify] @%s tweet %s: %v", entry.Handle, tweet.ID, err)
-			pollStats.TotalErrors++
+	// Primary: single API call via device_follow
+	xc := p.nextClient()
+	dfTweets, err := xc.GetDeviceFollowTweets(40)
+	if err != nil {
+		if isAuthError(err) {
+			logError("[poll] device_follow auth error: %v (cookie may be expired)", err)
 		} else {
-			logInfo("[notify] @%s → tweet %s sent", entry.Handle, tweet.ID)
-			pollStats.TotalTweets++
+			logWarn("[poll] device_follow failed: %v — falling back to per-account polling", err)
 		}
-		time.Sleep(100 * time.Millisecond) // Discord rate limit
+		pollStats.TotalErrors++
+		// Fallback to per-account polling
+		return p.scanOncePerAccount()
 	}
 
-	// Update notification cursor
-	if newCursor != "" && newCursor != lastCursor {
-		p.state.SetNotifCursor(newCursor)
+	logDebug("[poll] device_follow returned %d tweets", len(dfTweets))
+
+	// Match tweets to watched accounts
+	for i := range dfTweets {
+		dft := &dfTweets[i]
+		watchEntries, isWatched := userEntries[dft.UserID]
+		if !isWatched {
+			continue
+		}
+
+		for _, entry := range watchEntries {
+			lastTweetID := p.state.GetLastTweetID(strings.ToLower(entry.Handle))
+
+			// Skip old tweets
+			if lastTweetID != "" && dft.ID <= lastTweetID {
+				continue
+			}
+
+			// Skip retweets if mode is not all+replies
+			if dft.IsRetweet && entry.NotifyMode != "all+replies" {
+				continue
+			}
+
+			matched++
+			tweet := dft.ToTweet()
+			if err := p.bot.SendTweetNotification(entry.ChannelID, tweet, entry.Handle); err != nil {
+				logError("[notify] @%s tweet %s: %v", entry.Handle, dft.ID, err)
+				pollStats.TotalErrors++
+			} else {
+				logInfo("[notify] @%s → tweet %s sent (via device_follow)", entry.Handle, dft.ID)
+				pollStats.TotalTweets++
+			}
+			time.Sleep(100 * time.Millisecond) // Discord rate limit
+		}
 	}
 
-	// Also update per-account baselines for watched accounts
-	for _, tweet := range page.Tweets {
-		handle := strings.ToLower(tweet.Author.ScreenName)
-		if _, ok := watchMap[handle]; ok {
-			current := p.state.GetLastTweetID(handle)
-			if current == "" || tweet.ID > current {
-				p.state.SetLastTweetID(handle, tweet.ID)
+	// Update baselines: for each watched user, find newest tweet in response
+	for userID, watchEnts := range userEntries {
+		var newestID string
+		for i := range dfTweets {
+			if dfTweets[i].UserID == userID {
+				if newestID == "" || dfTweets[i].ID > newestID {
+					newestID = dfTweets[i].ID
+				}
+			}
+		}
+		if newestID != "" {
+			for _, entry := range watchEnts {
+				current := p.state.GetLastTweetID(strings.ToLower(entry.Handle))
+				if current == "" || newestID > current {
+					p.state.SetLastTweetID(strings.ToLower(entry.Handle), newestID)
+				}
 			}
 		}
 	}
 
-	p.state.Save()
+	if matched > 0 {
+		p.state.Save()
+	}
 
 	elapsed := time.Since(started)
-	logDebug("[poll] scan done: %d tweets matched from notifications in %s", matched, elapsed.Round(time.Millisecond))
+	logDebug("[poll] scan done: %d new tweets found in %s (device_follow)", matched, elapsed.Round(time.Millisecond))
+	return matched > 0
+}
+
+// scanOncePerAccount is the legacy fallback that polls each watched account individually.
+func (p *Poller) scanOncePerAccount() bool {
+	entries := p.watch.GetAll()
+	matched := 0
+
+	for _, entry := range entries {
+		xc := p.nextClient()
+		tweets, err := xc.GetUserTweets(entry.UserID, 5)
+		if err != nil {
+			if isAuthError(err) {
+				logError("[poll] auth error for @%s: %v (cookie may be expired)", entry.Handle, err)
+			} else {
+				logWarn("[poll] @%s timeline: %v", entry.Handle, err)
+			}
+			pollStats.TotalErrors++
+			continue
+		}
+
+		if len(tweets) == 0 {
+			continue
+		}
+
+		lastTweetID := p.state.GetLastTweetID(strings.ToLower(entry.Handle))
+
+		for _, tweet := range tweets {
+			if lastTweetID != "" && tweet.ID <= lastTweetID {
+				break
+			}
+			if tweet.IsRetweet && entry.NotifyMode != "all+replies" {
+				continue
+			}
+
+			matched++
+			if err := p.bot.SendTweetNotification(entry.ChannelID, tweet, entry.Handle); err != nil {
+				logError("[notify] @%s tweet %s: %v", entry.Handle, tweet.ID, err)
+				pollStats.TotalErrors++
+			} else {
+				logInfo("[notify] @%s → tweet %s sent (fallback)", entry.Handle, tweet.ID)
+				pollStats.TotalTweets++
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		if len(tweets) > 0 {
+			newestID := tweets[0].ID
+			current := p.state.GetLastTweetID(strings.ToLower(entry.Handle))
+			if current == "" || newestID > current {
+				p.state.SetLastTweetID(strings.ToLower(entry.Handle), newestID)
+			}
+		}
+
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	if matched > 0 {
+		p.state.Save()
+	}
 	return matched > 0
 }
 
