@@ -978,7 +978,7 @@ func (db *DiscordBot) SendTweetNotification(channelID string, tweet Tweet, watch
 		}
 	}
 
-	embed.Description = fmt.Sprintf("%s\n\n🔗 [View on X](%s)", tweet.Text, tweet.TweetURL)
+	embed.Description = tweet.Text
 
 	// Metrics field
 	var metricsParts []string
@@ -1016,7 +1016,35 @@ func (db *DiscordBot) SendTweetNotification(channelID string, tweet Tweet, watch
 		Text: fmt.Sprintf("x-notify-dc | %s WIB", time.Now().In(loc).Format("02/01/2006, 15:04:05")),
 	}
 
-	_, err := db.session.ChannelMessageSendEmbed(channelID, embed)
+	// Action buttons (Discord link components) — like the Waypoint-style cards.
+	var buttons []discordgo.MessageComponent
+	if tweet.TweetURL != "" {
+		buttons = append(buttons, discordgo.Button{
+			Label: "View Tweet",
+			Style: discordgo.LinkButton,
+			Emoji: &discordgo.ComponentEmoji{Name: "🐦"},
+			URL:   tweet.TweetURL,
+		})
+	}
+	if tweet.Author.ScreenName != "" {
+		buttons = append(buttons, discordgo.Button{
+			Label: "Profile",
+			Style: discordgo.LinkButton,
+			Emoji: &discordgo.ComponentEmoji{Name: "👤"},
+			URL:   fmt.Sprintf("https://x.com/%s", tweet.Author.ScreenName),
+		})
+	}
+
+	msg := &discordgo.MessageSend{
+		Embeds: []*discordgo.MessageEmbed{embed},
+	}
+	if len(buttons) > 0 {
+		msg.Components = []discordgo.MessageComponent{
+			discordgo.ActionsRow{Components: buttons},
+		}
+	}
+
+	_, err := db.session.ChannelMessageSendComplex(channelID, msg)
 	return err
 }
 
