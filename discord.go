@@ -11,10 +11,10 @@ import (
 
 // DiscordBot manages Discord interactions and embeds.
 type DiscordBot struct {
-	session  *discordgo.Session
-	cfg      *Config
-	watch    *WatchManager
-	xClients []*XClient
+	session   *discordgo.Session
+	cfg       *Config
+	watch     *WatchManager
+	xClients  []*XClient
 	clientIdx int
 }
 
@@ -897,10 +897,10 @@ func (db *DiscordBot) handleSettings(s *discordgo.Session, i *discordgo.Interact
 // ────────────────────────────────────────────────────────
 
 var pollStats struct {
-	LastPollTime  time.Time
-	TotalPolls    int64
-	TotalTweets   int64
-	TotalErrors   int64
+	LastPollTime time.Time
+	TotalPolls   int64
+	TotalTweets  int64
+	TotalErrors  int64
 }
 
 func (db *DiscordBot) handleStatus(s *discordgo.Session, i *discordgo.InteractionCreate) {
@@ -1016,6 +1016,27 @@ func (db *DiscordBot) SendTweetNotification(channelID string, tweet Tweet, watch
 		Text: fmt.Sprintf("x-notify-dc | %s WIB", time.Now().In(loc).Format("02/01/2006, 15:04:05")),
 	}
 
+	// Contract-address auto-detection. Scan the tweet text plus any expanded
+	// URLs (a CA is sometimes only in a linked-out string) for EVM/Solana
+	// addresses, and surface them as a copyable field + DexScreener buttons.
+	caScanText := tweet.Text
+	if len(tweet.URLs) > 0 {
+		caScanText += " " + joinStrings(tweet.URLs, " ")
+	}
+	contracts := detectContracts(caScanText)
+	if len(contracts) > 0 {
+		var caLines []string
+		for _, c := range contracts {
+			// `inline code` makes the full address one-tap copyable on mobile.
+			caLines = append(caLines, fmt.Sprintf("`%s` · [📈 chart](%s)", c.Address, c.DexScreenerURL()))
+		}
+		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
+			Name:   "💰 Contract Detected",
+			Value:  joinStrings(caLines, "\n"),
+			Inline: false,
+		})
+	}
+
 	// Action buttons (Discord link components) — like the Waypoint-style cards.
 	var buttons []discordgo.MessageComponent
 	if tweet.TweetURL != "" {
@@ -1032,6 +1053,24 @@ func (db *DiscordBot) SendTweetNotification(channelID string, tweet Tweet, watch
 			Style: discordgo.LinkButton,
 			Emoji: &discordgo.ComponentEmoji{Name: "👤"},
 			URL:   fmt.Sprintf("https://x.com/%s", tweet.Author.ScreenName),
+		})
+	}
+	// One DexScreener chart button per detected contract. Discord caps an
+	// ActionsRow at 5 buttons, and we already use up to 2 (View Tweet, Profile),
+	// so add at most 3 chart buttons to stay within the limit.
+	for idx, c := range contracts {
+		if idx >= 3 {
+			break
+		}
+		label := "Chart"
+		if len(contracts) > 1 {
+			label = fmt.Sprintf("Chart %s", c.Short())
+		}
+		buttons = append(buttons, discordgo.Button{
+			Label: label,
+			Style: discordgo.LinkButton,
+			Emoji: &discordgo.ComponentEmoji{Name: "📈"},
+			URL:   c.DexScreenerURL(),
 		})
 	}
 
