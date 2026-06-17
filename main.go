@@ -12,6 +12,7 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.yaml", "path to config file")
+	selftestCA := flag.Bool("selftest-ca", false, "send sample contract-address notifications to the default channel, then exit")
 	flag.Parse()
 
 	// Load config
@@ -81,6 +82,15 @@ func main() {
 	}
 	logInfo("discord connected")
 
+	// Self-test path: send a few sample contract-address notifications to the
+	// default channel, then exit. Used to eyeball the CA-detection embed without
+	// waiting for a real tweet. Does not start the poller.
+	if *selftestCA {
+		runSelftestCA(bot, cfg)
+		bot.Close()
+		return
+	}
+
 	// Register slash commands (guild-specific for instant availability, or global)
 	guildID := cfg.Discord.GuildID
 	if err := bot.RegisterCommands(guildID); err != nil {
@@ -120,4 +130,55 @@ func main() {
 	state.Save()
 	bot.Close()
 	logInfo("x-notify-dc exited")
+}
+
+// runSelftestCA fires a few synthetic tweet notifications through the real
+// SendTweetNotification path so the CA-detection embed can be verified live in
+// the default channel. Each sample exercises a different detection case.
+func runSelftestCA(bot *DiscordBot, cfg *Config) {
+	channel := cfg.Discord.DefaultChannel
+	if channel == "" {
+		logError("[selftest] no default_channel configured")
+		return
+	}
+
+	samples := []struct {
+		name  string
+		tweet Tweet
+	}{
+		{
+			name: "EVM contract",
+			tweet: Tweet{
+				Text:     "🚀 $WINTER is live!\n\nCA: 0x07696DcaB55E62cfef953666b29Fe1970518cB00\n\nApe in before it sends. LP locked, renounced.",
+				TweetURL: "https://x.com/DezXBT/status/1111111111111111111",
+			},
+		},
+		{
+			name: "Solana contract (cue-gated)",
+			tweet: Tweet{
+				Text:     "new pump.fun launch 👀 contract: 3yYuW2UjLNYki79HSGj37XUMAyLkr6kxFwkLBYypHEgq lfg",
+				TweetURL: "https://x.com/DezXBT/status/2222222222222222222",
+			},
+		},
+		{
+			name: "Plain tweet (no CA — control)",
+			tweet: Tweet{
+				Text:     "gm. just vibing today, no charts. ☕",
+				TweetURL: "https://x.com/DezXBT/status/3333333333333333333",
+			},
+		},
+	}
+
+	for _, s := range samples {
+		s.tweet.Author.Name = "Winter Test"
+		s.tweet.Author.ScreenName = "DezXBT"
+		s.tweet.Metrics.Likes = 123
+		s.tweet.Metrics.Views = 45678
+		if err := bot.SendTweetNotification(channel, s.tweet, "DezXBT"); err != nil {
+			logError("[selftest] %s: send failed: %v", s.name, err)
+		} else {
+			logInfo("[selftest] %s: sent ✓", s.name)
+		}
+	}
+	logInfo("[selftest] done — check channel %s", channel)
 }
