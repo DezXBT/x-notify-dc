@@ -66,13 +66,47 @@ func TestDetectContractsEmpty(t *testing.T) {
 	}
 }
 
-func TestDexScreenerURL(t *testing.T) {
+func TestChartURLFallback(t *testing.T) {
+	// Unresolved contract falls back to a search link.
 	c := DetectedContract{Address: "0xabc", Chain: "evm"}
-	if got := c.DexScreenerURL(); got != "https://dexscreener.com/search?q=0xabc" {
-		t.Errorf("unexpected url: %q", got)
+	if got := c.ChartURL(); got != "https://dexscreener.com/search?q=0xabc" {
+		t.Errorf("unexpected fallback url: %q", got)
 	}
-	if got := (DetectedContract{}).DexScreenerURL(); got != "" {
+	if c.Resolved() {
+		t.Errorf("expected unresolved contract")
+	}
+	// Resolved contract uses the direct pair URL.
+	c.PairURL = "https://dexscreener.com/base/0x1f827b2e5a3c32d538d0c14078ccaa3fdf8f319c"
+	if got := c.ChartURL(); got != c.PairURL {
+		t.Errorf("expected direct pair URL, got %q", got)
+	}
+	if !c.Resolved() {
+		t.Errorf("expected resolved contract")
+	}
+	// Empty address -> empty url.
+	if got := (DetectedContract{}).ChartURL(); got != "" {
 		t.Errorf("expected empty url for empty address, got %q", got)
+	}
+}
+
+func TestBestPair(t *testing.T) {
+	if bestPair(nil) != nil {
+		t.Errorf("expected nil for no pairs")
+	}
+	pairs := []dexPair{
+		{ChainID: "ethereum", URL: "u1", Liquidity: struct {
+			USD float64 `json:"usd"`
+		}{USD: 1000}},
+		{ChainID: "base", URL: "u2", Liquidity: struct {
+			USD float64 `json:"usd"`
+		}{USD: 50000}},
+		{ChainID: "bsc", URL: "u3", Liquidity: struct {
+			USD float64 `json:"usd"`
+		}{USD: 200}},
+	}
+	best := bestPair(pairs)
+	if best == nil || best.ChainID != "base" || best.URL != "u2" {
+		t.Errorf("expected highest-liquidity pair (base/u2), got %+v", best)
 	}
 }
 

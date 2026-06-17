@@ -1018,17 +1018,32 @@ func (db *DiscordBot) SendTweetNotification(channelID string, tweet Tweet, watch
 
 	// Contract-address auto-detection. Scan the tweet text plus any expanded
 	// URLs (a CA is sometimes only in a linked-out string) for EVM/Solana
-	// addresses, and surface them as a copyable field + DexScreener buttons.
+	// addresses, resolve each to its DexScreener pair (exact chain + direct
+	// chart link, Rick-bot style), and surface them as a copyable field +
+	// chart buttons.
 	caScanText := tweet.Text
 	if len(tweet.URLs) > 0 {
 		caScanText += " " + joinStrings(tweet.URLs, " ")
 	}
 	contracts := detectContracts(caScanText)
+	for i := range contracts {
+		contracts[i].ResolveDexScreener()
+	}
 	if len(contracts) > 0 {
 		var caLines []string
 		for _, c := range contracts {
-			// `inline code` makes the full address one-tap copyable on mobile.
-			caLines = append(caLines, fmt.Sprintf("`%s` · [📈 chart](%s)", c.Address, c.DexScreenerURL()))
+			line := fmt.Sprintf("`%s`", c.Address)
+			// Tag with symbol + resolved chain when we found a real pair.
+			if c.Resolved() {
+				tag := c.ResolvedChain
+				if c.Symbol != "" {
+					tag = "$" + c.Symbol + " · " + c.ResolvedChain
+				}
+				line += fmt.Sprintf("\n↳ [📈 %s](%s)", tag, c.ChartURL())
+			} else {
+				line += fmt.Sprintf(" · [🔍 search](%s)", c.ChartURL())
+			}
+			caLines = append(caLines, line)
 		}
 		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
 			Name:   "💰 Contract Detected",
@@ -1063,14 +1078,19 @@ func (db *DiscordBot) SendTweetNotification(channelID string, tweet Tweet, watch
 			break
 		}
 		label := "Chart"
-		if len(contracts) > 1 {
+		switch {
+		case c.Resolved() && c.Symbol != "":
+			label = fmt.Sprintf("📈 $%s (%s)", c.Symbol, c.ResolvedChain)
+		case c.Resolved():
+			label = fmt.Sprintf("📈 Chart (%s)", c.ResolvedChain)
+		case len(contracts) > 1:
 			label = fmt.Sprintf("Chart %s", c.Short())
 		}
 		buttons = append(buttons, discordgo.Button{
 			Label: label,
 			Style: discordgo.LinkButton,
 			Emoji: &discordgo.ComponentEmoji{Name: "📈"},
-			URL:   c.DexScreenerURL(),
+			URL:   c.ChartURL(),
 		})
 	}
 

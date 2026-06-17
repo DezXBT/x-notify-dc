@@ -1,8 +1,13 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
 	"regexp"
+	"sort"
 	"strings"
+	"time"
 )
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -25,18 +30,51 @@ var solAddrRe = regexp.MustCompile(`(?:^|[^1-9A-HJ-NP-Za-km-z])([1-9A-HJ-NP-Za-k
 // DetectedContract is a single contract found in a tweet plus its chain hint.
 type DetectedContract struct {
 	Address string // the raw contract address
-	Chain   string // "evm" or "sol"
+	Chain   string // detection-time guess: "evm" or "sol"
+
+	// Resolved (filled by ResolveDexScreener; zero until then):
+	ResolvedChain string // exact DexScreener chainId, e.g. "ethereum", "base", "solana"
+	PairURL       string // direct DexScreener pair URL, e.g. dexscreener.com/base/0x…
+	Symbol        string // base token symbol from the top pair, e.g. "WPRL"
+	LiquidityUSD  float64
 }
 
-// DexScreenerURL returns the DexScreener link for this contract. The
-// /search?q= endpoint resolves across every chain DexScreener indexes, so an
-// exact chain isn't required.
-func (d DetectedContract) DexScreenerURL() string {
+// dexScreener is the shared HTTP client for token lookups (short timeout so a
+// slow API never holds up a notification).
+var dexScreener = &http.Client{Timeout: 6 * time.Second}
+
+// dexTokenAPI is the DexScreener token endpoint; %s is the contract address.
+// It returns every pair the address trades in, across all chains.
+const dexTokenAPI = "https://api.dexscreener.com/latest/dex/tokens/%s"
+
+// dexPair mirrors the fields we use from a DexScreener pair object.
+type dexPair struct {
+	ChainID   string `json:"chainId"`
+	URL       string `json:"url"`
+	BaseToken struct {
+		Address string `json:"address"`
+		Symbol  string `json:"symbol"`
+	} `json:"baseToken"`
+	Liquidity struct {
+		USD float64 `json:"usd"`
+	} `json:"liquidity"`
+}
+
+// ChartURL returns the best DexScreener link for this contract: the resolved
+// direct pair URL when available (Rick-bot style, dexscreener.com/<chain>/<pair>),
+// otherwise a generic search link as a safe fallback.
+func (d DetectedContract) ChartURL() string {
+	if d.PairURL != "" {
+		return d.PairURL
+	}
 	if d.Address == "" {
 		return ""
 	}
 	return "https://dexscreener.com/search?q=" + d.Address
 }
+
+// Resolved reports whether a direct DexScreener pair link was found.
+func (d DetectedContract) Resolved() bool { return d.PairURL != "" }
 
 // Short renders the address as 0x1234…abcd for compact display in an embed
 // field, keeping the full value available via the button URL.
@@ -46,6 +84,58 @@ func (d DetectedContract) Short() string {
 		return a
 	}
 	return a[:6] + "…" + a[len(a)-4:]
+}
+
+// ResolveDexScreener looks the contract up on DexScreener and fills the resolved
+// chain, direct pair URL, symbol, and liquidity from the highest-liquidity pair.
+// It mutates the receiver in place. Network/parse failures are non-fatal: the
+// contract simply stays unresolved and ChartURL falls back to a search link.
+func (d *DetectedContract) ResolveDexScreener() {
+	if d.Address == "" {
+		return
+	}
+	url := strings.Replace(dexTokenAPI, "%s", d.Address, 1)
+	resp, err := dexScreener.Get(url)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return
+	}
+	var parsed struct {
+		Pairs []dexPair `json:"pairs"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return
+	}
+	pick := bestPair(parsed.Pairs)
+	if pick == nil {
+		return
+	}
+	d.ResolvedChain = pick.ChainID
+	d.PairURL = pick.URL
+	d.Symbol = pick.BaseToken.Symbol
+	d.LiquidityUSD = pick.Liquidity.USD
+}
+
+// bestPair returns the highest-liquidity pair from a DexScreener response, or
+// nil when there are none. Highest liquidity is the most useful chart to land
+// on (matches what Rick-style bots surface).
+func bestPair(pairs []dexPair) *dexPair {
+	if len(pairs) == 0 {
+		return nil
+	}
+	sorted := make([]dexPair, len(pairs))
+	copy(sorted, pairs)
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].Liquidity.USD > sorted[j].Liquidity.USD
+	})
+	return &sorted[0]
 }
 
 // detectContracts scans text for contract addresses and returns every distinct
