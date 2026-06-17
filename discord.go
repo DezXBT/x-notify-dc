@@ -980,28 +980,6 @@ func (db *DiscordBot) SendTweetNotification(channelID string, tweet Tweet, watch
 
 	embed.Description = tweet.Text
 
-	// Metrics field
-	var metricsParts []string
-	if tweet.Metrics.Likes > 0 {
-		metricsParts = append(metricsParts, fmt.Sprintf("❤️ %s", FormatCompact(tweet.Metrics.Likes)))
-	}
-	if tweet.Metrics.Retweets > 0 {
-		metricsParts = append(metricsParts, fmt.Sprintf("🔁 %s", FormatCompact(tweet.Metrics.Retweets)))
-	}
-	if tweet.Metrics.Replies > 0 {
-		metricsParts = append(metricsParts, fmt.Sprintf("💬 %s", FormatCompact(tweet.Metrics.Replies)))
-	}
-	if tweet.Metrics.Views > 0 {
-		metricsParts = append(metricsParts, fmt.Sprintf("👁️ %s", FormatCompact(tweet.Metrics.Views)))
-	}
-	if len(metricsParts) > 0 {
-		embed.Fields = append(embed.Fields, &discordgo.MessageEmbedField{
-			Name:   "Engagement",
-			Value:  joinStrings(metricsParts, "  "),
-			Inline: false,
-		})
-	}
-
 	// Media: use first image as embed image
 	if len(tweet.MediaURLs) > 0 {
 		embed.Image = &discordgo.MessageEmbedImage{URL: tweet.MediaURLs[0]}
