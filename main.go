@@ -147,16 +147,16 @@ func runSelftestCA(bot *DiscordBot, cfg *Config) {
 		tweet Tweet
 	}{
 		{
-			name: "EVM contract",
+			name: "EVM contract (real)",
 			tweet: Tweet{
-				Text:     "🚀 $WINTER is live!\n\nCA: 0x07696DcaB55E62cfef953666b29Fe1970518cB00\n\nApe in before it sends. LP locked, renounced.",
-				TweetURL: "https://x.com/DezXBT/status/1111111111111111111",
+				Text:     "🚀 $WPRL Wrapped Pearl is live!\n\nCA: 0x07696DcaB55E62cfef953666b29Fe1970518cB00\n\nBridge-backed, useful-work mined. Chart below 👇",
+				TweetURL: "https://x.com/pearlbridgexyz/status/1111111111111111111",
 			},
 		},
 		{
-			name: "Solana contract (cue-gated)",
+			name: "Solana contract (real pump.fun)",
 			tweet: Tweet{
-				Text:     "new pump.fun launch 👀 contract: 3yYuW2UjLNYki79HSGj37XUMAyLkr6kxFwkLBYypHEgq lfg",
+				Text:     "new launch 👀 Tqj8yFmagrg7oorpQkVGYR52r96RFTamvWfth9bpump\n\nsend it",
 				TweetURL: "https://x.com/DezXBT/status/2222222222222222222",
 			},
 		},
