@@ -57,6 +57,34 @@ func TestDetectContractsSolana(t *testing.T) {
 	}
 }
 
+func TestDetectContractsNoEVMasSolana(t *testing.T) {
+	// Real-world bug: a tweet containing the same EVM CA twice (lowercase +
+	// checksummed) was producing 2 detections — the checksummed version without
+	// "0x" got picked up by the Solana base58 matcher. After fix it must be 1.
+	evm := "0x76a43f44149b6f4ab296af27dcf7f28f6421aba3"
+	chksum := "76A43F44149b6f4aB296af27DCF7F28F6421ABA3" // same, checksummed, no 0x
+	text := "CA: " + evm + " contract detected " + chksum + " 🔍 search"
+	got := detectContracts(text)
+	if len(got) != 1 {
+		t.Fatalf("expected 1 EVM contract (deduped), got %d: %+v", len(got), got)
+	}
+	if got[0].Chain != "evm" {
+		t.Errorf("expected chain=evm, got %q", got[0].Chain)
+	}
+}
+
+func TestIsHexString(t *testing.T) {
+	if !isHexString("76A43F44149b6f4aB296af27DCF7F28F6421ABA3") {
+		t.Error("expected 40-char hex to pass")
+	}
+	if isHexString("3yYuW2UjLNYki79HSGj37XUMAyLkr6kxFwkLBYypHEgq") {
+		t.Error("expected non-hex base58 to fail")
+	}
+	if isHexString("short") {
+		t.Error("expected short string to fail")
+	}
+}
+
 func TestDetectContractsEmpty(t *testing.T) {
 	if got := detectContracts(""); got != nil {
 		t.Errorf("expected nil for empty text, got %+v", got)

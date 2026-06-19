@@ -153,21 +153,29 @@ func detectContracts(text string) []DetectedContract {
 	seen := make(map[string]bool)
 	var out []DetectedContract
 
-	// EVM: collect all 0x… matches.
+	// EVM: collect all 0x… matches. Register both the full address and the
+	// bare hex body (lowercased) so the Solana matcher can't re-detect a
+	// checksummed EVM address that lost its "0" prefix as a base58 candidate.
 	for _, m := range evmAddrRe.FindAllStringSubmatch(text, -1) {
 		addr := m[1]
-		if !seen[strings.ToLower(addr)] {
-			seen[strings.ToLower(addr)] = true
+		lower := strings.ToLower(addr)
+		if !seen[lower] {
+			seen[lower] = true
+			seen[lower[2:]] = true // "76a43f…aba3" — blocks Solana false match
 			out = append(out, DetectedContract{Address: addr, Chain: "evm"})
 		}
 	}
 
-	// Solana: only when a cue is present, and only address-shaped candidates.
+	// Solana: only when a cue is present, and only address-shaped candidates
+	// that aren't hex-only (40 hex chars = EVM address, not Solana).
 	if hasContractCue(text) {
 		for _, m := range solAddrRe.FindAllStringSubmatch(text, -1) {
 			cand := m[1]
-			if looksLikeBase58Address(cand) && !seen[cand] {
-				seen[cand] = true
+			if isHexString(cand) {
+				continue // 40-char hex → EVM address masquerading as base58
+			}
+			if looksLikeBase58Address(cand) && !seen[strings.ToLower(cand)] {
+				seen[strings.ToLower(cand)] = true
 				out = append(out, DetectedContract{Address: cand, Chain: "sol"})
 			}
 		}
@@ -204,4 +212,19 @@ func looksLikeBase58Address(s string) bool {
 		}
 	}
 	return hasDigit && hasUpper && hasLower
+}
+
+// isHexString reports whether s is exactly 40 hex characters (the shape of an
+// EVM address without the 0x prefix). Used to reject EVM addresses that the
+// Solana base58 matcher would otherwise accept.
+func isHexString(s string) bool {
+	if len(s) != 40 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
